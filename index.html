@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>中野区ポスティング踏破チェック</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html,body,#map{height:100%;margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+    .panel{position:absolute;z-index:1000;top:10px;left:10px;right:10px;background:rgba(255,255,255,.94);padding:10px;border-radius:12px;box-shadow:0 2px 10px #0002;font-size:14px;max-width:520px;}
+    .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px;}
+    button{font-size:15px;padding:7px 10px;border:0;border-radius:8px;background:#1f6feb;color:white;font-weight:700;}
+    button.gray{background:#666;} button.red{background:#c62828;} button.green{background:#188038;}
+    #status{line-height:1.45;margin-top:6px;} .small{font-size:12px;color:#444;}
+    .legend{display:inline-block;width:18px;height:4px;margin-right:4px;vertical-align:middle;border-radius:2px;}
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <b>中野区ポスティング踏破チェック</b>
+  <div class="row">
+    <button onclick="startTracking()">開始</button>
+    <button class="gray" onclick="stopTracking()">停止</button>
+    <button class="red" onclick="resetAll()">リセット</button>
+    <button class="green" onclick="downloadLog()">記録DL</button>
+  </div>
+  <div id="status">読込中...</div>
+  <div class="small"><span class="legend" style="background:#888"></span>未踏道路 <span class="legend" style="background:#18a058"></span>踏破済 <span class="legend" style="background:#0b57d0"></span>歩行軌跡</div>
+</div>
+<script>
+const map = L.map('map', { zoomControl: false }).setView([35.707,139.665], 14);
+L.control.zoom({position:'bottomright'}).addTo(map);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 20, attribution:'&copy; OpenStreetMap'}).addTo(map);
+
+let roads = [];
+let walkedIds = new Set(JSON.parse(localStorage.getItem('walkedRoadIds') || '[]'));
+let track = JSON.parse(localStorage.getItem('walkedTrack') || '[]');
+let watchId = null;
+let currentMarker = null;
+const walkedLine = L.polyline(track, {color:'#0b57d0', weight:5, opacity:.9}).addTo(map);
+
+function status(msg){ document.getElementById('status').innerHTML = msg; }
+function save(){ localStorage.setItem('walkedRoadIds', JSON.stringify([...walkedIds])); localStorage.setItem('walkedTrack', JSON.stringify(track)); }
+function projectMeters(lat,lng,lat0){ const R=6371000; return [lng*Math.PI/180*R*Math.cos(lat0*Math.PI/180), lat*Math.PI/180*R]; }
+function distPointToSegMeters(p, a, b){
+  const lat0=p[0]; const P=projectMeters(p[0],p[1],lat0), A=projectMeters(a[0],a[1],lat0), B=projectMeters(b[0],b[1],lat0);
+  const vx=B[0]-A[0], vy=B[1]-A[1], wx=P[0]-A[0], wy=P[1]-A[1];
+  const c1=vx*wx+vy*wy, c2=vx*vx+vy*vy; let t=c2?c1/c2:0; t=Math.max(0,Math.min(1,t));
+  const x=A[0]+t*vx, y=A[1]+t*vy; return Math.hypot(P[0]-x,P[1]-y);
+}
+function markWalked(latlng){
+  const threshold = 18; // GPSズレ吸収。厳しめにするなら10〜12へ。
+  for(const r of roads){
+    if(walkedIds.has(r.id)) continue;
+    for(let i=0;i<r.latlngs.length-1;i++){
+      if(distPointToSegMeters(latlng, r.latlngs[i], r.latlngs[i+1]) <= threshold){
+        walkedIds.add(r.id); r.layer.setStyle({color:'#18a058', weight:6, opacity:.95}); break;
+      }
+    }
+  }
+  save(); updateStatus();
+}
+function updateStatus(extra=''){
+  const pct = roads.length ? Math.round(walkedIds.size / roads.length * 1000)/10 : 0;
+  status(`${extra}踏破：<b>${walkedIds.size}</b> / ${roads.length} 道路（${pct}%）<br>軌跡点：${track.length}`);
+}
+
+Promise.all([
+  fetch('areas.geojson').then(r=>r.json()),
+  fetch('roads.geojson').then(r=>r.json())
+]).then(([areas, roadData]) => {
+  const areaLayer = L.geoJSON(areas, {style:{color:'#ff8c00', weight:3, fillColor:'#ffd54f', fillOpacity:.10}, onEachFeature:(f,l)=>{ if(f.properties?.name) l.bindPopup(f.properties.name); }}).addTo(map);
+  const roadLayer = L.geoJSON(roadData, {style:f=>({color: walkedIds.has(f.properties.id)?'#18a058':'#888', weight: walkedIds.has(f.properties.id)?6:4, opacity:.85}), onEachFeature:(f,l)=>{
+    const coords = f.geometry.coordinates.map(c=>[c[1],c[0]]);
+    roads.push({id:f.properties.id, name:f.properties.name||'', layer:l, latlngs:coords});
+  }}).addTo(map);
+  const group = L.featureGroup([areaLayer, roadLayer]); map.fitBounds(group.getBounds(), {padding:[20,20]}); updateStatus('読込完了。');
+}).catch(e => status('読み込みエラー：' + e.message));
+
+function startTracking(){
+  if(!navigator.geolocation){ alert('この端末ではGPSが使えません'); return; }
+  if(watchId !== null) return;
+  watchId = navigator.geolocation.watchPosition(pos=>{
+    const latlng=[pos.coords.latitude, pos.coords.longitude];
+    track.push(latlng); walkedLine.setLatLngs(track);
+    if(currentMarker) currentMarker.setLatLng(latlng); else currentMarker=L.circleMarker(latlng,{radius:8,color:'#d93025',fillColor:'#d93025',fillOpacity:1}).addTo(map).bindPopup('現在地');
+    map.setView(latlng, Math.max(map.getZoom(),17)); markWalked(latlng);
+  }, err=>alert('GPSエラー：'+err.message), {enableHighAccuracy:true, maximumAge:0, timeout:10000});
+  updateStatus('記録中。');
+}
+function stopTracking(){ if(watchId!==null){ navigator.geolocation.clearWatch(watchId); watchId=null; } updateStatus('停止中。'); }
+function resetAll(){ if(!confirm('踏破済み道路と歩行軌跡を消しますか？')) return; stopTracking(); walkedIds.clear(); track=[]; walkedLine.setLatLngs([]); for(const r of roads) r.layer.setStyle({color:'#888', weight:4, opacity:.85}); localStorage.removeItem('walkedRoadIds'); localStorage.removeItem('walkedTrack'); updateStatus('リセット済み。'); }
+function downloadLog(){
+  const data={savedAt:new Date().toISOString(), walkedRoadIds:[...walkedIds], trackLatLng:track};
+  const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='posting_walk_log.json'; a.click(); URL.revokeObjectURL(a.href);
+}
+</script>
+</body>
+</html>
